@@ -1,0 +1,4 @@
+# Локальный запуск конвейера: act читает .github/workflows
+# Флаги --artifact-server-path и --secret-file act не разрешает задавать
+# в проектном .actrc, они передаются в командной строке (см. Makefile).
+-P ubuntu-latest=catthehacker/ubuntu:act-latest

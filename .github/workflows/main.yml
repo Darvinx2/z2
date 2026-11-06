@@ -1,0 +1,201 @@
+name: CI/CD
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.13"
+  IMAGE_NAME: secure-file-manager
+  IMAGE_TAG: latest
+  CONTAINER_NAME: filemanager-app
+
+jobs:
+  # --- Стадия 1: сборка --------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # кэш зависимостей ускоряет повторные запуски конвейера
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Compile sources
+        run: python -m compileall -q app
+
+      - name: Build wheel and sdist
+        run: python -m build --outdir dist
+
+      # артефакт сборки передаётся в стадию развёртывания
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  # --- Стадия 2: модульные тесты -----------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # у каждой джобы свой подкаталог отчётов: при локальном запуске через
+      # act с --bind джобы делят одну рабочую директорию
+      - name: Prepare reports directory
+        run: rm -rf reports/test && mkdir -p reports/test
+
+      # отчёты: JUnit по тестам и Cobertura по покрытию
+      - name: Run unit tests
+        run: |
+          pytest \
+            --junitxml=reports/test/junit.xml \
+            --cov --cov-report=xml:reports/test/coverage.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: reports/test/
+          retention-days: 7
+
+  # --- Стадия 3: статический анализ безопасности -------------------------
+  sast:
+    name: SAST
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: rm -rf reports/sast && mkdir -p reports/sast
+
+      # Semgrep ищет уязвимости в коде; --error роняет джобу на находках
+      # уровня ERROR (High/Critical)
+      - name: Semgrep (code scan)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:latest \
+            semgrep scan \
+              --config p/python \
+              --config p/secrets \
+              --severity ERROR \
+              --error \
+              --json-output reports/sast/semgrep.json \
+              --metrics off \
+              .
+
+      # Trivy проверяет зависимости и конфигурацию на известные уязвимости
+      - name: Trivy (dependencies and IaC scan)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src aquasec/trivy:latest \
+            filesystem \
+              --scanners vuln,secret,misconfig \
+              --severity HIGH,CRITICAL \
+              --exit-code 1 \
+              --no-progress \
+              --format table \
+              --output reports/sast/trivy.txt \
+              . || (cat reports/sast/trivy.txt; exit 1)
+
+      - name: Upload SAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: reports/sast/
+          retention-days: 7
+
+  # --- Стадия 4: локальное развёртывание ---------------------------------
+  deploy:
+    name: Local deploy
+    runs-on: ubuntu-latest
+    needs: [test, sast]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # многоступенчатая сборка: финальный образ без инструментов сборки
+      - name: Build Docker image
+        run: docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
+
+      - name: Check image runs as non-root
+        run: |
+          user="$(docker run --rm "$IMAGE_NAME:$IMAGE_TAG" id -un)"
+          echo "Контейнер работает от пользователя: $user"
+          test "$user" != "root"
+
+      # секреты передаются переменными окружения раннера, а не лежат в коде
+      - name: Run container with published port
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            -p 8080:8080 \
+            -e DATABASE_URL \
+            "$IMAGE_NAME:$IMAGE_TAG" python -m app.health
+
+      - name: Smoke test health endpoint
+        run: |
+          for attempt in $(seq 1 10); do
+            if docker run --rm --network "container:$CONTAINER_NAME" curlimages/curl:latest \
+                 -fsS http://127.0.0.1:8080/health; then
+              echo "Приложение отвечает"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs "$CONTAINER_NAME"
+          exit 1
+
+      - name: Save image as artifact
+        run: |
+          rm -rf image && mkdir -p image
+          docker save "$IMAGE_NAME:$IMAGE_TAG" | gzip > "image/$IMAGE_NAME-$IMAGE_TAG.tar.gz"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image/*.tar.gz
+          retention-days: 7
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true

@@ -5,3 +5,11 @@ __pycache__/
 storage/*
 !storage/.gitkeep
 .idea/
+.secrets
+reports/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.coverage
+image/
